@@ -149,17 +149,18 @@ def extract_page_data_ai(image_path: str, model: str = DEFAULT_MODEL) -> List[Di
 
 
 def clean_bubble_interior(crop: np.ndarray, is_bubble: bool = True) -> np.ndarray:
-    """Removes text strokes cleanly without ghosting, preserving borders."""
+    """Removes text strokes cleanly without ghosting, preserving borders and background art."""
     h_c, w_c = crop.shape[:2]
     if h_c < 10 or w_c < 10:
         return crop
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    
+    median_val = np.median(gray)
+
     if is_bubble:
-        median_val = np.median(gray)
         if median_val > 160:
-            dark_thresh = min(150, int(median_val * 0.75))
+            # White / bright bubble: dark text strokes on bright background
+            dark_thresh = min(155, int(median_val * 0.78))
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((gray < dark_thresh).astype(np.uint8))
             mask = np.zeros_like(gray)
             for i in range(1, num_labels):
@@ -168,13 +169,15 @@ def clean_bubble_interior(crop: np.ndarray, is_bubble: bool = True) -> np.ndarra
                 y = stats[i, cv2.CC_STAT_TOP]
                 w = stats[i, cv2.CC_STAT_WIDTH]
                 h = stats[i, cv2.CC_STAT_HEIGHT]
+                # Filter out outer border: don't touch crop perimeter
                 if x > 3 and y > 3 and (x + w) < (w_c - 3) and (y + h) < (h_c - 3) and area < (h_c * w_c * 0.6):
                     mask[labels == i] = 255
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             dilated = cv2.dilate(mask, k, iterations=1)
             return cv2.inpaint(crop, dilated, 3, cv2.INPAINT_TELEA)
         else:
-            bright_thresh = max(120, int(median_val * 1.35))
+            # Dark / black shout bubble: light text strokes on dark interior
+            bright_thresh = max(115, int(median_val * 1.35))
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((gray > bright_thresh).astype(np.uint8))
             mask = np.zeros_like(gray)
             for i in range(1, num_labels):
@@ -189,82 +192,116 @@ def clean_bubble_interior(crop: np.ndarray, is_bubble: bool = True) -> np.ndarra
             dilated = cv2.dilate(mask, k, iterations=1)
             return cv2.inpaint(crop, dilated, 3, cv2.INPAINT_TELEA)
     else:
-        grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-        _, mask = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dilated = cv2.dilate(mask, k, iterations=1)
+        # Non-bubble (SFX, signs, artwork text):
+        # Text characters have strong color or brightness contrast against local background
+        diff_from_median = np.abs(gray.astype(np.int32) - int(median_val)).astype(np.uint8)
+        _, contrast_mask = cv2.threshold(diff_from_median, 35, 255, cv2.THRESH_BINARY)
+        
+        # Exclude crop edges to prevent bleeding into surrounding lines
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(contrast_mask)
+        clean_mask = np.zeros_like(gray)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            if x > 2 and y > 2 and (x + w) < (w_c - 2) and (y + h) < (h_c - 2) and area < (h_c * w_c * 0.75):
+                clean_mask[labels == i] = 255
+                
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilated = cv2.dilate(clean_mask, k, iterations=1)
         return cv2.inpaint(crop, dilated, 3, cv2.INPAINT_TELEA)
 
 
-def compute_true_centroid(crop: np.ndarray, is_bubble: bool = True) -> Tuple[float, float]:
-    """Calculates mathematical centroid of bubble interior via image moments, stripping pointer tails."""
+def compute_true_centroid(crop: np.ndarray, is_bubble: bool = True) -> Tuple[float, float, int, int]:
+    """Calculates mathematical centroid and safe dimensions of bubble interior via image moments, stripping pointer tails."""
     h_c, w_c = crop.shape[:2]
     default_cx, default_cy = w_c / 2.0, h_c / 2.0
+    safe_w, safe_h = int(w_c * 0.85), int(h_c * 0.85)
     
     if not is_bubble or h_c < 20 or w_c < 20:
-        return default_cx, default_cy
+        return default_cx, default_cy, safe_w, safe_h
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     median_val = np.median(gray)
     
     if median_val > 160:
-        white = (gray > 180).astype(np.uint8)
+        white = (gray > 180).astype(np.uint8) * 255
     else:
-        white = (gray < 80).astype(np.uint8)
+        white = (gray < 85).astype(np.uint8) * 255
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(white)
-    best_id = -1
-    best_area = 0
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area > best_area and area > 400:
-            best_area = area
-            best_id = i
+    # Bridge black letters inside the bubble so they form one connected component
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    closed = cv2.morphologyEx(white, cv2.MORPH_CLOSE, k_close)
 
-    if best_id == -1:
-        return default_cx, default_cy
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed)
+    # Pick component nearest to center with decent area
+    cy_c, cx_c = h_c // 2, w_c // 2
+    best_id = labels[cy_c, cx_c]
+    if best_id == 0 or stats[best_id, cv2.CC_STAT_AREA] < 400:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        best_id = np.argmax(areas) + 1 if len(areas) > 0 else 0
 
-    mask = (labels == best_id).astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    core = cv2.erode(mask, k, iterations=1)
+    if best_id == 0 or stats[best_id, cv2.CC_STAT_AREA] < 400:
+        return default_cx, default_cy, safe_w, safe_h
+
+    bubble_mask = (labels == best_id).astype(np.uint8) * 255
+    bw_box = stats[best_id, cv2.CC_STAT_WIDTH]
+    bh_box = stats[best_id, cv2.CC_STAT_HEIGHT]
+
+    # Erode tail
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    core = cv2.erode(bubble_mask, k_erode, iterations=1)
     if np.sum(core) == 0:
-        core = mask
+        core = bubble_mask
         
     M = cv2.moments(core)
     if M["m00"] == 0:
-        return default_cx, default_cy
-    return M["m10"] / M["m00"], M["m01"] / M["m00"]
+        return default_cx, default_cy, int(bw_box * 0.85), int(bh_box * 0.85)
+
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    return cx, cy, int(bw_box * 0.88), int(bh_box * 0.88)
 
 
-def format_persian_lines(text: str, font_path: str, max_w: int, max_h: int) -> Tuple[List[str], int]:
-    """Dynamically finds optimal font size and balanced line wraps."""
+def format_persian_lines(text: str, font_path: str, max_w: int, max_h: int, is_oval: bool = True) -> Tuple[List[str], int]:
+    """Dynamically finds optimal font size and balanced oval/diamond silhouette wraps."""
     words = text.split()
     if not words:
         return [text], 20
 
-    for fsize in range(42, 14, -2):
+    # Step down font size from large to compact
+    for fsize in range(40, 11, -2):
         font = ImageFont.truetype(font_path, fsize)
-        step = int(fsize * 1.22)
+        step = int(fsize * 1.20)
         
-        for width_chars in [14, 18, 22, 26, 32, 40]:
-            lines = textwrap.wrap(text, width=width_chars)
+        # Test line splits: from 1 to 6 lines
+        total_words = len(words)
+        for num_lines in range(1, min(6, total_words + 1)):
+            avg_chars = max(10, len(text) // num_lines + 3)
+            lines = textwrap.wrap(text, width=avg_chars)
             tot_h = len(lines) * step
             if tot_h > max_h:
                 continue
             
+            # Check line widths with oval silhouette constraint
             fits = True
-            for l in lines:
+            for i, l in enumerate(lines):
+                if is_oval and len(lines) > 2 and (i == 0 or i == len(lines) - 1):
+                    allowed_w = max_w * 0.76  # Top & bottom lines of oval are narrower
+                else:
+                    allowed_w = max_w * 0.95
+                    
                 reshaped = get_display(arabic_reshaper.reshape(l))
                 bbox = font.getbbox(reshaped)
                 lw = bbox[2] - bbox[0]
-                if lw > max_w:
+                if lw > allowed_w:
                     fits = False
                     break
             if fits:
                 return lines, fsize
 
-    min_size = 15
-    return textwrap.wrap(text, width=20), min_size
+    # Fallback to compact size
+    min_size = 12
+    return textwrap.wrap(text, width=22), min_size
 
 
 def render_page(
@@ -307,7 +344,7 @@ def render_page(
 
         is_bubble = it.get("type") in ["bubble", "scream"]
         crop = clean_img[y1:y2, x1:x2]
-        cx_rel, cy_rel = compute_true_centroid(crop, is_bubble=is_bubble)
+        cx_rel, cy_rel, safe_w, safe_h = compute_true_centroid(crop, is_bubble=is_bubble)
         abs_cx = x1 + cx_rel
         abs_cy = y1 + cy_rel
 
@@ -316,9 +353,10 @@ def render_page(
             continue
 
         item_type = it.get("type", "bubble")
-        lines, fsize = format_persian_lines(fa_text, font_path, int(bw * 0.88), int(bh * 0.88))
+        is_oval = item_type in ["bubble", "scream"]
+        lines, fsize = format_persian_lines(fa_text, font_path, safe_w, safe_h, is_oval=is_oval)
         font = ImageFont.truetype(font_path, fsize)
-        step = int(fsize * 1.22)
+        step = int(fsize * 1.20)
         total_h = len(lines) * step
         start_y = abs_cy - (total_h / 2.0)
 
